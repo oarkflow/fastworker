@@ -27,5 +27,12 @@ func ReportProgress(ctx context.Context, percent int, message string) {
 	if qj == nil {
 		return
 	}
-	qj.progress.Store(Progress{Percent: percent, Message: message})
+	pr := Progress{Percent: percent, Message: message}
+	qj.progress.Store(pr)
+	if qj.opts.Callback != nil && qj.opts.Callback.OnProgress != nil {
+		qj.opts.Callback.OnProgress(ctx, qj.info(), pr)
+	}
+	if qj.pool != nil {
+		qj.pool.emit(Event{Type: EventJobProgress, Job: qj.info(), Options: qj.opts, Queue: qj.opts.Queue, Attempt: qj.attempt, Message: message})
+	}
 }

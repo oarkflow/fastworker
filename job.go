@@ -53,6 +53,7 @@ type JobOptions struct {
 	RateLimitKey        string
 	Result              any
 	Callback            *Callback
+	LifecycleMetadata   map[string]string
 }
 
 type JobState uint32
@@ -120,6 +121,7 @@ type queuedJob struct {
 	lastErr     atomic.Value // string
 	rateReadyAt time.Time
 	progress    atomic.Value // Progress
+	pool        *Pool
 }
 
 func (q *queuedJob) info() JobInfo {

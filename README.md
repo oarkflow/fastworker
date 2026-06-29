@@ -678,3 +678,158 @@ BenchmarkSubmitRunReusableJob     ~609 ns/op    0 B/op   0 allocs/op
 ```
 
 Use `PresetLowLatency` or `PresetHighThroughput` for hot paths, and enable the usability features only where they are needed.
+
+## Comprehensive Lifecycle, Hooks and Callbacks
+
+`fastworker` now has two hook layers:
+
+1. **Pool-wide lifecycle event bus** for audit, metrics, tracing, logging and control-plane integrations.
+2. **Per-job callbacks** for request-level success, error, retry, progress and finalization handling.
+
+### Lifecycle event bus
+
+```go
+lc := fastworker.NewLifecycle()
+lc.On(func(ctx context.Context, e fastworker.Event) {
+    log.Printf("event=%s pool=%s queue=%s job=%s worker=%d attempt=%d err=%s",
+        e.Type, e.Pool, e.Queue, e.Job.ID, e.WorkerID, e.Attempt, e.ErrorText)
+})
+
+pool := fastworker.MustNewPool(
+    fastworker.WithWorkers(8),
+    fastworker.WithLifecycle(lc),
+)
+```
+
+You can subscribe to all events or only specific event types:
+
+```go
+unsubscribe := pool.On(func(ctx context.Context, e fastworker.Event) {
+    fmt.Println(e.Type, e.Job.ID)
+}, fastworker.EventJobSucceeded, fastworker.EventJobDeadLettered)
+defer unsubscribe()
+```
+
+Handlers are panic-safe. A panic inside a lifecycle handler is recovered and counted by:
+
+```go
+lc.RecoveredPanics()
+```
+
+Lifecycle handlers are synchronous by default for deterministic audit ordering. For slow handlers:
+
+```go
+pool := fastworker.MustNewPool(
+    fastworker.WithAsyncLifecycle(true),
+    fastworker.WithLifecycleHook(func(ctx context.Context, e fastworker.Event) {
+        // non-blocking async hook
+    }),
+)
+```
+
+### Lifecycle coverage
+
+Lifecycle events cover:
+
+- pool creation, start, pause, resume, stop, terminate
+- drain start and completion
+- queue pause/resume/full/spill
+- worker start/stop/idle lifecycle
+- job submit, accept, reject, queue, dequeue
+- job start, success, failure, retry, dead-letter, cancel
+- job timeout, panic, progress
+- rate-limit delayed execution
+- concurrency-limit delayed execution
+
+Important event constants include:
+
+```go
+fastworker.EventPoolStarted
+fastworker.EventPoolPaused
+fastworker.EventPoolResumed
+fastworker.EventPoolStopped
+fastworker.EventPoolTerminated
+fastworker.EventWorkerStarted
+fastworker.EventWorkerStopped
+fastworker.EventJobSubmitted
+fastworker.EventJobAccepted
+fastworker.EventJobRejected
+fastworker.EventJobStarted
+fastworker.EventJobProgress
+fastworker.EventJobSucceeded
+fastworker.EventJobFailed
+fastworker.EventJobRetrying
+fastworker.EventJobDeadLettered
+fastworker.EventJobCancelled
+fastworker.EventJobRateDelayed
+fastworker.EventJobConcurrencyDelayed
+```
+
+### Per-job callbacks
+
+Use callbacks when the producer of a specific job needs direct notification:
+
+```go
+cb := &fastworker.Callback{
+    OnQueued: func(ctx context.Context, j fastworker.JobInfo) {
+        fmt.Println("queued", j.ID)
+    },
+    OnStart: func(ctx context.Context, j fastworker.JobInfo) {
+        fmt.Println("started", j.ID, j.Attempts)
+    },
+    OnProgress: func(ctx context.Context, j fastworker.JobInfo, p fastworker.Progress) {
+        fmt.Println("progress", p.Percent, p.Message)
+    },
+    OnRetry: func(ctx context.Context, j fastworker.JobInfo, attempt int, err error) {
+        fmt.Println("retry", attempt, err)
+    },
+    OnSuccess: func(ctx context.Context, j fastworker.JobInfo) {
+        fmt.Println("success", j.ID)
+    },
+    OnDeadLetter: func(ctx context.Context, j fastworker.JobInfo, err error) {
+        fmt.Println("dead letter", j.ID, err)
+    },
+    OnFinally: func(ctx context.Context, j fastworker.JobInfo, err error) {
+        fmt.Println("finished", j.ID, err)
+    },
+}
+
+_ = pool.SubmitFunc(func(ctx context.Context) error {
+    fastworker.ReportProgress(ctx, 50, "half done")
+    return nil
+}, fastworker.JobOptions{ID: "job-1", Callback: cb})
+```
+
+Available callbacks:
+
+- `OnQueued`
+- `OnStart`
+- `OnSuccess`
+- `OnError`
+- `OnRetry`
+- `OnDeadLetter`
+- `OnCancel`
+- `OnPanic`
+- `OnProgress`
+- `OnFinally`
+
+### Legacy lightweight hooks
+
+The original low-overhead `Hooks` API remains supported:
+
+```go
+pool := fastworker.MustNewPool(fastworker.WithHooks(fastworker.Hooks{
+    OnPoolStart: func(p *fastworker.Pool) {},
+    OnJobStart: func(ctx context.Context, opt fastworker.JobOptions, attempt int) {},
+    OnJobSuccess: func(ctx context.Context, opt fastworker.JobOptions, attempt int) {},
+}))
+```
+
+For new applications, prefer the lifecycle event bus for full coverage and structured event data.
+
+Run examples:
+
+```bash
+go run ./examples/lifecycle
+go run ./examples/callbacks
+```

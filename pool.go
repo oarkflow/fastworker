@@ -68,6 +68,7 @@ type Pool struct {
 	jobs           sync.Map // job id -> *queuedJob
 	scaleStop      chan struct{}
 	store          Store
+	lifecycle      *Lifecycle
 	jobPool        sync.Pool
 	queueMu        sync.RWMutex
 	queueDefaults  map[string]QueuePolicy
@@ -94,6 +95,7 @@ func New(c Config, opts ...Option) (*Pool, error) {
 	for _, o := range opts {
 		o(p)
 	}
+	p.emit(Event{Type: EventPoolCreated})
 	return p, nil
 }
 
@@ -120,6 +122,7 @@ func WithStore(s Store) Option {
 }
 
 func (p *Pool) Start() error {
+	p.emit(Event{Type: EventPoolStarting})
 	if !p.state.CompareAndSwap(uint32(stateNew), uint32(stateRunning)) {
 		return nil
 	}
@@ -133,6 +136,7 @@ func (p *Pool) Start() error {
 	if p.hooks.OnPoolStart != nil {
 		p.hooks.OnPoolStart(p)
 	}
+	p.emit(Event{Type: EventPoolStarted})
 	return nil
 }
 func (p *Pool) spawnWorker() { id := int(p.workers.Add(1)); p.wg.Add(1); go p.worker(id) }
@@ -187,18 +191,23 @@ func (p *Pool) SubmitResult(fn func(context.Context) (any, error), opts ...JobOp
 
 func (p *Pool) submit(job Job, f *futureAny, opts ...JobOptions) (*queuedJob, error) {
 	p.c.submitted.Add(1)
+	p.emit(Event{Type: EventJobSubmitting})
 	st := State(p.state.Load())
 	if st == stateTerminated {
 		p.c.rejected.Add(1)
+		p.emit(Event{Type: EventJobRejected, Error: ErrTerminated})
 		return nil, ErrTerminated
 	}
 	if st == stateStopping || st == stateStopped {
 		p.c.rejected.Add(1)
+		p.emit(Event{Type: EventJobRejected, Error: ErrClosed})
 		return nil, ErrClosed
 	}
 	if job == nil {
 		p.c.rejected.Add(1)
-		return nil, fmt.Errorf("%w: nil job", ErrInvalidConfig)
+		err := fmt.Errorf("%w: nil job", ErrInvalidConfig)
+		p.emit(Event{Type: EventJobRejected, Error: err})
+		return nil, err
 	}
 	var opt JobOptions
 	if len(opts) > 0 {
@@ -228,11 +237,13 @@ func (p *Pool) submit(job Job, f *futureAny, opts ...JobOptions) (*queuedJob, er
 	if opt.IdempotencyKey != "" {
 		if _, loaded := p.idemp.LoadOrStore(opt.IdempotencyKey, opt.ID); loaded {
 			p.c.rejected.Add(1)
+			p.emit(Event{Type: EventJobRejected, Error: ErrDuplicate, Options: opt, Queue: opt.Queue})
 			return nil, ErrDuplicate
 		}
 	}
 	if err := p.admitRate(opt.RateLimitKey); err != nil {
 		p.c.rejected.Add(1)
+		p.emit(Event{Type: EventJobRejected, Error: err, Options: opt, Queue: opt.Queue})
 		return nil, err
 	}
 	now := time.Now()
@@ -252,13 +263,17 @@ func (p *Pool) submit(job Job, f *futureAny, opts ...JobOptions) (*queuedJob, er
 		job = Chain(job, p.middleware...)
 	}
 	qj := p.jobPool.Get().(*queuedJob)
-	*qj = queuedJob{seq: p.seq.Add(1), job: job, opts: opt, createdAt: now, runAt: runAt, future: f, ctx: ctx, cancel: cancel}
+	*qj = queuedJob{seq: p.seq.Add(1), job: job, opts: opt, createdAt: now, runAt: runAt, future: f, ctx: ctx, cancel: cancel, pool: p}
 	qj.state.Store(uint32(JobQueued))
 	if f != nil {
 		f.cancel = cancel
 	}
 	if p.hooks.OnJobSubmit != nil {
 		p.hooks.OnJobSubmit(opt)
+	}
+	p.emitJob(EventJobSubmitted, qj, 0, nil, "")
+	if opt.Callback != nil && opt.Callback.OnQueued != nil {
+		opt.Callback.OnQueued(context.Background(), qj.info())
 	}
 	if p.cfg.EnableJobTracking && opt.ID != "" {
 		p.jobs.Store(opt.ID, qj)
@@ -288,9 +303,11 @@ func (p *Pool) submit(job Job, f *futureAny, opts ...JobOptions) (*queuedJob, er
 	if !ok {
 		if p.trySpill(qj) {
 			p.c.accepted.Add(1)
+			p.emitJob(EventJobAccepted, qj, 0, nil, "spilled")
 			return qj, nil
 		}
 		p.c.rejected.Add(1)
+		p.emitJob(EventJobRejected, qj, 0, ErrQueueFull, "")
 		if p.cfg.EnableJobTracking && opt.ID != "" {
 			p.jobs.Delete(opt.ID)
 		}
@@ -301,11 +318,13 @@ func (p *Pool) submit(job Job, f *futureAny, opts ...JobOptions) (*queuedJob, er
 		return nil, ErrQueueFull
 	}
 	p.c.accepted.Add(1)
+	p.emitJob(EventJobAccepted, qj, 0, nil, "")
+	p.emitJob(EventJobQueued, qj, 0, nil, "")
 	return qj, nil
 }
 func (p *Pool) useBasicFastPath(job Job, opt JobOptions, f *futureAny) bool {
 	return f == nil && p.store == nil && !p.cfg.EnableJobTracking && !p.cfg.EnableJobIDs && len(p.middleware) == 0 &&
-		p.hooks.OnJobSubmit == nil && p.hooks.OnJobStart == nil && p.hooks.OnJobSuccess == nil && p.hooks.OnJobError == nil && p.hooks.OnJobPanic == nil && p.spillPath == "" &&
+		p.lifecycle == nil && p.hooks.OnJobSubmit == nil && p.hooks.OnJobStart == nil && p.hooks.OnJobSuccess == nil && p.hooks.OnJobError == nil && p.hooks.OnJobPanic == nil && p.spillPath == "" &&
 		opt.Queue == "" && opt.Priority == PriorityNormal && opt.Delay == 0 && opt.RunAt.IsZero() && opt.Timeout == 0 &&
 		opt.MaxAttempts == 1 && opt.Backoff == p.cfg.DefaultBackoff && len(opt.Metadata) == 0 && opt.IdempotencyKey == "" && opt.ConcurrencyKey == "" && opt.RateLimitKey == ""
 }
@@ -384,12 +403,15 @@ func (p *Pool) pushBlock(item queue.Item[*queuedJob]) bool {
 }
 
 func (p *Pool) worker(id int) {
+	p.emit(Event{Type: EventWorkerStarting, WorkerID: id})
 	defer func() {
 		p.workers.Add(-1)
 		p.wg.Done()
+		p.emit(Event{Type: EventWorkerStopping, WorkerID: id})
 		if p.hooks.OnWorkerStop != nil {
 			p.hooks.OnWorkerStop(id)
 		}
+		p.emit(Event{Type: EventWorkerStopped, WorkerID: id})
 	}()
 	workerState := &Worker{ID: id}
 	if p.workerInit != nil {
@@ -403,6 +425,7 @@ func (p *Pool) worker(id int) {
 	if p.hooks.OnWorkerStart != nil {
 		p.hooks.OnWorkerStart(id)
 	}
+	p.emit(Event{Type: EventWorkerStarted, WorkerID: id})
 	for {
 		if State(p.state.Load()) == stateTerminated {
 			return
@@ -517,6 +540,7 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 	if qj == nil {
 		return
 	}
+	p.emitJob(EventJobDequeued, qj, qj.attempt, nil, "")
 	if qj.ctx != nil && qj.ctx.Err() != nil {
 		qj.state.Store(uint32(JobCancelled))
 		qj.finishedAt = time.Now()
@@ -529,6 +553,13 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 		if qj.future != nil {
 			qj.future.complete(nil, ErrCancelled)
 		}
+		if qj.opts.Callback != nil && qj.opts.Callback.OnCancel != nil {
+			qj.opts.Callback.OnCancel(context.Background(), qj.info())
+		}
+		if qj.opts.Callback != nil && qj.opts.Callback.OnFinally != nil {
+			qj.opts.Callback.OnFinally(context.Background(), qj.info(), ErrCancelled)
+		}
+		p.emitJob(EventJobCancelled, qj, qj.attempt, ErrCancelled, "")
 		p.releaseJob(qj)
 		return
 	}
@@ -544,6 +575,7 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 		return
 	}
 	if !p.sem.tryAcquire(qj.opts.ConcurrencyKey, qj.opts.MaxConcurrentPerKey) {
+		p.emitJob(EventJobConcurrencyDelayed, qj, qj.attempt, nil, "concurrency limit")
 		qj.runAt = time.Now().Add(5 * time.Millisecond)
 		qj.state.Store(uint32(JobQueued))
 		if !p.requeue(qj) {
@@ -564,6 +596,10 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 	qj.attempt++
 	qj.startedAt = time.Now()
 	qj.state.Store(uint32(JobRunning))
+	p.emitJob(EventJobStarting, qj, qj.attempt, nil, "")
+	if qj.opts.Callback != nil && qj.opts.Callback.OnStart != nil {
+		qj.opts.Callback.OnStart(ctx, qj.info())
+	}
 	if p.store != nil {
 		_ = p.store.SaveJob(context.Background(), qj.info())
 	}
@@ -573,6 +609,7 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 	if p.hooks.OnJobStart != nil {
 		p.hooks.OnJobStart(ctx, qj.opts, qj.attempt)
 	}
+	p.emitJob(EventJobStarted, qj, qj.attempt, nil, "")
 	var err error
 	var panicVal any
 	func() {
@@ -583,6 +620,10 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 				if p.hooks.OnJobPanic != nil {
 					p.hooks.OnJobPanic(ctx, qj.opts, qj.attempt, r)
 				}
+				if qj.opts.Callback != nil && qj.opts.Callback.OnPanic != nil {
+					qj.opts.Callback.OnPanic(ctx, qj.info(), r)
+				}
+				p.emit(Event{Type: EventJobPanic, WorkerID: id, Job: qj.info(), Options: qj.opts, Queue: qj.opts.Queue, Attempt: qj.attempt, Panic: r, Message: fmt.Sprint(r)})
 				if !p.cfg.RecoverPanics {
 					panic(r)
 				}
@@ -595,6 +636,7 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 	if ctx.Err() != nil && err == nil {
 		err = ctx.Err()
 		p.c.timedout.Add(1)
+		p.emitJob(EventJobTimeout, qj, qj.attempt, err, "")
 	}
 	if err == nil && panicVal == nil {
 		p.c.completed.Add(1)
@@ -612,9 +654,13 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 		if qj.opts.Callback != nil && qj.opts.Callback.OnSuccess != nil {
 			qj.opts.Callback.OnSuccess(ctx, qj.info())
 		}
+		if qj.opts.Callback != nil && qj.opts.Callback.OnFinally != nil {
+			qj.opts.Callback.OnFinally(ctx, qj.info(), nil)
+		}
 		if p.hooks.OnJobSuccess != nil {
 			p.hooks.OnJobSuccess(ctx, qj.opts, qj.attempt)
 		}
+		p.emitJob(EventJobSucceeded, qj, qj.attempt, nil, "")
 		if qj.opts.IdempotencyKey != "" {
 			p.idemp.Delete(qj.opts.IdempotencyKey)
 		}
@@ -629,11 +675,19 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 	if p.hooks.OnJobError != nil {
 		p.hooks.OnJobError(ctx, qj.opts, qj.attempt, err)
 	}
+	p.emitJob(EventJobFailed, qj, qj.attempt, err, "")
+	if qj.opts.Callback != nil && qj.opts.Callback.OnError != nil {
+		qj.opts.Callback.OnError(ctx, qj.info(), err)
+	}
 	if qj.attempt < qj.opts.MaxAttempts && !IsPermanent(err) && State(p.state.Load()) < stateStopping {
 		p.c.retried.Add(1)
 		if p.hooks.OnJobRetry != nil {
 			p.hooks.OnJobRetry(qj.opts, qj.attempt, err)
 		}
+		if qj.opts.Callback != nil && qj.opts.Callback.OnRetry != nil {
+			qj.opts.Callback.OnRetry(ctx, qj.info(), qj.attempt, err)
+		}
+		p.emitJob(EventJobRetrying, qj, qj.attempt, err, "")
 		qj.state.Store(uint32(JobRetrying))
 		delay := qj.opts.Backoff.Delay(qj.attempt)
 		qj.runAt = time.Now().Add(delay)
@@ -664,12 +718,16 @@ func (p *Pool) deadletter(qj *queuedJob, err error) {
 	if qj.future != nil {
 		qj.future.complete(nil, err)
 	}
-	if qj.opts.Callback != nil && qj.opts.Callback.OnError != nil {
-		qj.opts.Callback.OnError(context.Background(), qj.info(), err)
+	if qj.opts.Callback != nil && qj.opts.Callback.OnDeadLetter != nil {
+		qj.opts.Callback.OnDeadLetter(context.Background(), qj.info(), err)
+	}
+	if qj.opts.Callback != nil && qj.opts.Callback.OnFinally != nil {
+		qj.opts.Callback.OnFinally(context.Background(), qj.info(), err)
 	}
 	if p.hooks.OnJobDeadLetter != nil {
 		p.hooks.OnJobDeadLetter(qj.opts, qj.attempt, err)
 	}
+	p.emitJob(EventJobDeadLettered, qj, qj.attempt, err, "")
 	if qj.opts.IdempotencyKey != "" {
 		p.idemp.Delete(qj.opts.IdempotencyKey)
 	}
@@ -687,7 +745,9 @@ func (p *Pool) Pause() error {
 	for {
 		s := State(p.state.Load())
 		if s == stateRunning {
+			p.emit(Event{Type: EventPoolPausing})
 			if p.state.CompareAndSwap(uint32(s), uint32(statePaused)) {
+				p.emit(Event{Type: EventPoolPaused})
 				return nil
 			}
 			continue
@@ -702,7 +762,9 @@ func (p *Pool) Resume() error {
 	for {
 		s := State(p.state.Load())
 		if s == statePaused {
+			p.emit(Event{Type: EventPoolResuming})
 			if p.state.CompareAndSwap(uint32(s), uint32(stateRunning)) {
+				p.emit(Event{Type: EventPoolResumed})
 				return nil
 			}
 			continue
@@ -720,6 +782,7 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 		return ErrTerminated
 	}
 	if s < stateStopping {
+		p.emit(Event{Type: EventPoolStopping})
 		p.state.Store(uint32(stateStopping))
 		close(p.scaleStop)
 		p.closeOnce.Do(func() { p.basicq.Close(); p.fastq.Close() })
@@ -733,6 +796,7 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 	select {
 	case <-done:
 		p.state.Store(uint32(stateStopped))
+		p.emit(Event{Type: EventPoolStopped})
 		p.cancel()
 		if p.store != nil {
 			_ = p.store.Close()
@@ -743,6 +807,7 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 	}
 }
 func (p *Pool) Terminate() error {
+	p.emit(Event{Type: EventPoolTerminating})
 	s := State(p.state.Swap(uint32(stateTerminated)))
 	if s == stateTerminated {
 		return nil
@@ -753,6 +818,7 @@ func (p *Pool) Terminate() error {
 	if p.store != nil {
 		_ = p.store.Close()
 	}
+	p.emit(Event{Type: EventPoolTerminated})
 	return nil
 }
 
@@ -847,6 +913,7 @@ func (p *Pool) delayForRateLimit(qj *queuedJob) bool {
 	qj.rateReadyAt = qj.runAt
 	qj.state.Store(uint32(JobQueued))
 	p.c.rateDelayed.Add(1)
+	p.emitJob(EventJobRateDelayed, qj, qj.attempt, nil, "rate limited")
 	if !p.requeue(qj) {
 		p.deadletter(qj, ErrQueueFull)
 	}
@@ -887,6 +954,7 @@ func (p *Pool) trySpill(qj *queuedJob) bool {
 		return false
 	}
 	p.spill = append(p.spill, qj)
+	p.emitJob(EventQueueSpill, qj, qj.attempt, nil, "spilled to overflow")
 	if p.spillPath != "" {
 		_ = os.MkdirAll(p.spillPath, 0o755)
 		f, err := os.OpenFile(filepath.Join(p.spillPath, "spill.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)

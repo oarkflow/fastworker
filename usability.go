@@ -86,6 +86,7 @@ func (p *Pool) PauseQueue(name string) {
 		p.queueMu.Lock()
 		p.pausedQueues[name] = true
 		p.queueMu.Unlock()
+		p.emit(Event{Type: EventQueuePaused, Queue: name})
 		p.signalQueueWake()
 	}
 }
@@ -94,6 +95,7 @@ func (p *Pool) ResumeQueue(name string) {
 		p.queueMu.Lock()
 		delete(p.pausedQueues, name)
 		p.queueMu.Unlock()
+		p.emit(Event{Type: EventQueueResumed, Queue: name})
 		p.signalQueueWake()
 	}
 }

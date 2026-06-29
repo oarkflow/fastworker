@@ -50,7 +50,14 @@ func (p *Pool) WaitIdle(ctx context.Context) error {
 // Drain rejects new jobs by entering stopping state, waits for all accepted
 // jobs to finish, and then leaves the pool stopped. It is equivalent to a
 // graceful Stop but named for operational clarity.
-func (p *Pool) Drain(ctx context.Context) error { return p.Shutdown(ctx) }
+func (p *Pool) Drain(ctx context.Context) error {
+	p.emit(Event{Type: EventDrainStarted})
+	err := p.Shutdown(ctx)
+	if err == nil {
+		p.emit(Event{Type: EventDrainCompleted})
+	}
+	return err
+}
 
 // Wait waits for all worker goroutines to exit. It is useful after Terminate.
 func (p *Pool) Wait(ctx context.Context) error {
